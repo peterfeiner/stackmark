@@ -1,0 +1,5 @@
+.*.un~
+*.pyc
+*.atop
+index.html
+*.svg

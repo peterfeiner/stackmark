@@ -1,0 +1,29 @@
+#!/usr/bin/env gnuplot
+
+set macros
+set term svg size 800, 400
+set output input_file . '.svg'
+set style data lines
+#set xtics rotate
+#set xdata time
+#set timefmt '%s'
+set title input_file
+set xlabel 'time (s)'
+set ylabel 'utilization'
+#set yrange [0:1]
+set yrange [0:1]
+set xrange [0:50]
+
+start_time = `atop -r @input_file -PCPU | grep CPU | head -n 1 | awk '{print $3}'`
+
+utilization(total, idle) = (total - idle) / total
+
+cpu_cmd = '< atop -r ' . input_file . ' -PCPU | sed -n "0,/^SEP$/d;p" | grep -v SEP'
+dsk_cmd = '< atop -r ' . input_file . ' -PDSK | sed -n "0,/^SEP$/d;p" | grep -v SEP | grep sda'
+
+plot cpu_cmd \
+     using ($3 - start_time):(utilization($6 * $7 * $8, $12)) \
+     title 'CPU', \
+     dsk_cmd \
+     using ($3 - start_time):($8 / ($6 * 1000)) \
+     title 'DSK'
