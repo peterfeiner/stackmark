@@ -1,8 +1,10 @@
 #!/bin/bash
 
+set -x
+
 if test $# -ne 1; then
-    echo 'usage: $0 input_file' 2>&1;
+    echo 'usage: $0 TITLE' 2>&1;
     exit 1
 fi
 
-exec gnuplot -e "input_file='$1';" plot.gpi
+exec gnuplot -e "TITLE='$1';" plot.gpi

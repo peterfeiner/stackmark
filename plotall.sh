@@ -1,7 +1,9 @@
 #!/bin/bash
 
-for x in *.atop; do
-    ./plot.sh $x &
+set -x
+
+for x in $(find . -name '*.atop'); do
+    ./plot.sh $(basename $x .atop) &
 done
 
 wait
@@ -11,7 +13,8 @@ cat > index.html << EOF
     <body>
 EOF
 
-for x in $(ls -t *.atop); do
+for x in $(find . -name '*.atop'); do
+    x=$(basename $x .atop)
 cat >> index.html << EOF
         <img src="$x.svg"><br>
 EOF

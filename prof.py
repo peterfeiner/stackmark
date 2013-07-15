@@ -193,8 +193,8 @@ class Atop(object):
 
     def start(self):
         assert self.process == None
-        path = '%s@%s.atop' % (self.title, timestamp().replace(' ', '-'))
-        self.process = Popen(['sudo', 'atop', '-w', path, str(self.interval)])
+        self.process = Popen(['sudo', 'atop', '-w', '%s.atop' % self.title,
+                                              str(self.interval)])
 
     def stop(self):
         self.process.send_signal(signal.SIGINT)
@@ -221,13 +221,14 @@ class NullAtop(object):
         pass
 
 class PhaseLog(object):
-    def __init__(self, timer):
+    def __init__(self, timer, title):
         self.last_phase = {}
         self.in_phase = {}
         self.timer = timer
         self.lock = Lock()
         self.order = []
         self.last_in_phase = {}
+        self.data = open('%s.phases' % title, 'w')
 
     def __enter__(self):
         self.start()
@@ -240,9 +241,10 @@ class PhaseLog(object):
         pass
 
     def stop(self):
-        pass
+        self.data.close()
 
     def event(self, experiment, *args):
+        t = self.timer.elapsed()
         with self.lock:
             phase = experiment.phase
             if phase not in self.in_phase:
@@ -251,6 +253,7 @@ class PhaseLog(object):
             try:
                 last_phase = self.last_phase[experiment]
             except KeyError:
+                last_phase = None
                 pass
             else:
                 # No change.
@@ -259,17 +262,22 @@ class PhaseLog(object):
                 self.in_phase[last_phase] -= 1
                 if self.in_phase[last_phase] == 0:
                     self.last_in_phase[last_phase] = experiment
+                self.data.write('%s\tin-%s\t%s\n' % (t, last_phase, self.in_phase[last_phase]))
+                self.data.write('%s\tend-%s\n' % (t, last_phase))
 
             self.in_phase.setdefault(phase, 0)
             self.in_phase[phase] += 1
+            self.data.write('%s\tstart-%s\n' % (t, phase))
+            self.data.write('%s\tin-%s\t%s\n' % (t, phase, self.in_phase[phase]))
             self.last_in_phase.pop(phase, None)
             self.last_phase[experiment] = phase
 
             with PRINT_LOCK:
-                print '%.2f' % self.timer.elapsed(), '\t',
+                print '%.2f' % t, '\t',
                 for phase in self.order:
                     print phase, '%-3d' % self.in_phase[phase], 
                 print
+
 
     def report(self):
         with PRINT_LOCK:
@@ -412,15 +420,16 @@ class Experiment(object):
             time.sleep(1)
 
 class ParallelExperiment(object):
-    def __init__(self, args, atop, nova):
+    def __init__(self, args, atop, nova, title):
         self.args = args
         self.atop = atop
         self.nova = nova
+        self.title = title
 
     def run(self):
         threads = []
         timer = Timer('total')
-        log = PhaseLog(timer)
+        log = PhaseLog(timer, self.title)
         timer.start()
         with self.atop, log:
             for i in range(self.args.n):
@@ -484,13 +493,15 @@ def main(argv):
         logging.basicConfig(level=logging.DEBUG)
         os.environ['NOVACLIENT_DEBUG'] = '1'
 
+    title = ('%s-%s@%s' % (args.op, args.n, timestamp())).replace(' ', '-')
+
     if args.atop:
-        atop = Atop('%s-%s' % (args.op, args.n), args.atop_interval)
+        atop = Atop(title, args.atop_interval)
     else:
         atop = NullAtop()
 
     nova = Nova(poolsize=args.client_pool_size, simple_list=args.simple_list)
-    experiment = ParallelExperiment(args, atop=atop, nova=nova)
+    experiment = ParallelExperiment(args, atop=atop, nova=nova, title=title)
     experiment.run()
 
 if __name__ == '__main__':

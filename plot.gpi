@@ -1,29 +1,54 @@
 #!/usr/bin/env gnuplot
 
+atop_file = TITLE . '.atop'
+phases_file = TITLE . '.phases'
+
 set macros
 set term svg size 800, 400
-set output input_file . '.svg'
+set output TITLE . '.svg'
 set style data lines
 #set xtics rotate
 #set xdata time
 #set timefmt '%s'
-set title input_file
+set title TITLE
 set xlabel 'time (s)'
-set ylabel 'utilization'
+set ylabel ''
 #set yrange [0:1]
-set yrange [0:1]
-set xrange [0:50]
+set yrange [-1:1]
+#set xrange [0:50]
 
-start_time = `atop -r @input_file -PCPU | grep CPU | head -n 1 | awk '{print $3}'`
+set xzeroaxis linetype 0 linewidth 1.000
+
+
+N = `echo @TITLE | sed 's/@.*//' | sed 's/.*-//'`
+start_time = `atop -r @atop_file  -PCPU | grep CPU | head -n 1 | awk '{print $3}'`
 
 utilization(total, idle) = (total - idle) / total
 
-cpu_cmd = '< atop -r ' . input_file . ' -PCPU | sed -n "0,/^SEP$/d;p" | grep -v SEP'
-dsk_cmd = '< atop -r ' . input_file . ' -PDSK | sed -n "0,/^SEP$/d;p" | grep -v SEP | grep sda'
+cpu_cmd = '< atop -r ' . TITLE . '.atop -PCPU | sed -n "0,/^SEP$/d;p" | grep -v SEP'
+dsk_cmd = '< atop -r ' . TITLE . '.atop -PDSK | sed -n "0,/^SEP$/d;p" | grep -v SEP | grep sda'
+active_cmd = '< grep "\<in-boot\>" ' . TITLE . '.phases'
+ping_cmd = '< grep "\<in-ping\>" ' . TITLE . '.phases'
+ssh_cmd = '< grep "\<in-ssh\>" ' . TITLE . '.phases'
+delete_cmd = '< grep "\<in-delete\>" ' . TITLE . '.phases'
 
-plot cpu_cmd \
-     using ($3 - start_time):(utilization($6 * $7 * $8, $12)) \
-     title 'CPU', \
+plot \
+     active_cmd \
+     using ($1):($3 / N) \
+     title 'booting / N', \
+     ping_cmd \
+     using ($1):($3 / N) \
+     title 'pinging / N', \
+     ssh_cmd \
+     using ($1):($3 / N) \
+     title 'sshing / N', \
+     delete_cmd \
+     using ($1):($3 / N) \
+     title 'deleting / N', \
+     cpu_cmd \
+     using ($3 - start_time):(utilization($6 * $7 * $8, $12) - 1) \
+     title 'U(CPU) - 1', \
      dsk_cmd \
-     using ($3 - start_time):($8 / ($6 * 1000)) \
-     title 'DSK'
+     using ($3 - start_time):($8 / ($6 * 1000) - 1) \
+     title 'U(DSK) - 1', \
+     '< true' using 1:2
