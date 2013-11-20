@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -x
+set -e
 
 for x in $(find . -name '*.atop'); do
     ./plot.sh $(dirname $x)/$(basename $x .atop) &

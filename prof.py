@@ -1,24 +1,32 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 import argparse
 import datetime
 import json
 import logging
-import novaclient
-import novaclient.shell
+import os
 import os
 import signal
 import sys
 import time
 
-from contextlib import contextmanager
-from numpy import mean, median
-from subprocess import Popen, check_output, CalledProcessError, PIPE
-from threading import Thread, Lock, Condition
+from subprocess import Popen, PIPE
+from threading import Thread, Lock, Condition, local
+
+import keystoneclient.v2_0.client
+import novaclient
+import novaclient.shell
 
 DEV_NULL = open('/dev/null', 'w+')
 
 PRINT_LOCK = Lock()
+
+def status_line(msg=None):
+    print '\r', ' ' * 80, '\r',
+    if msg is not None:
+        print msg,
+        print ' ',
+    sys.stdout.flush()
 
 def timestamp():
     return str(datetime.datetime.now())
@@ -57,15 +65,10 @@ class Instance(object):
         self.__nova.delete(self.__id)
 
     def __get(self):
-        instances = self.__nova.list()
-        for instance in instances:
-            if instance.id == self.__id:
-                return instance
-        raise InstanceDoesNotExistError(self.__id)
+        return self.__nova.show(self.__id)
 
     def any_ip(self):
-        instance = self.__get()
-        for addrs in instance.networks.itervalues():
+        for addrs in self.__get().networks.itervalues():
             if len(addrs) > 0:
                 return addrs[0]
         raise InstanceHasNoIpError(self.__id)
@@ -76,63 +79,99 @@ class Instance(object):
     def __repr__(self):
         return 'Instance(%r, %r)' % (self.__nova, self.__id)
 
-def create_novaclient():
-    shell = novaclient.shell.OpenStackComputeShell()
-    extensions = shell._discover_extensions('1.1')
-    no_cache = os.environ.get('OS_NO_CACHE', '1') in ['1', 'y']
-    getenv = os.environ.get
-    return novaclient.client.Client('2',
-                                    getenv('OS_USERNAME'),
-                                    getenv('OS_PASSWORD'),
-                                    getenv('OS_TENANT_NAME'),
-                                    getenv('OS_AUTH_URL'),
-                                    no_cache=no_cache,
-                                    http_log_debug=getenv('NOVACLIENT_DEBUG'),
-                                    extensions=extensions)
+class SharedTokenClientFactory(object):
 
-class NovaClientPool(object):
-    def __init__(self, size):
-        self.__all = set([create_novaclient() for i in range(size)])
-        self.__available = self.__all.copy()
-        self.__cond = Condition()
+    def __init__(self, username, password, tenant_name, tenant_id, auth_url):
+        self.username = username
+        self.password = password
+        self.tenant_name = tenant_name
+        self.tenant_id = tenant_id
+        self.auth_url = auth_url
 
-    @contextmanager
-    def scoped(self):
-        client = self.get()
-        try:
-            yield client
-        finally:
-            self.put(client)
+        self._auth_ref = None
+        self._nova_extensions = None
 
-    def get(self):
-        with self.__cond:
-            while len(self.__available) == 0:
-                self.__cond.wait()
-            return self.__available.pop()
+    @property
+    def auth_ref(self):
+        if self._auth_ref is None:
+            self.refresh_auth_ref()
+        return self._auth_ref
 
-    def put(self, client):
-        assert client in self.__all
-        assert client not in self.__available
-        with self.__cond:
-            self.__available.add(client)
-            self.__cond.notify()
+    @property
+    def service_catalog(self):
+        return self.auth_ref.service_catalog
+
+    @property
+    def nova_api_url(self):
+        return self.service_catalog.url_for(attr='region',
+                                            service_type='compute',
+                                            endpoint_type='publicURL')
+
+    @property
+    def nova_extensions(self):
+        if self._nova_extensions is None:
+            self.refresh_nova_extensions()
+        return self._nova_extensions
+
+    def refresh_auth_ref(self):
+        self._auth_ref = self.create_keystone().auth_ref
+
+    def refresh_nova_extensions(self):
+        shell = novaclient.shell.OpenStackComputeShell()
+        self._nova_extensions = shell._discover_extensions('1.1')
+
+    def create_nova(self):
+        client = novaclient.v1_1.Client(username=self.username,
+                                        api_key=self.password,
+                                        project_id=self.tenant_name,
+                                        tenant_id=self.auth_ref.tenant_id,
+                                        auth_url='/v2/')
+        client.client.management_url = self.nova_api_url
+        client.client.auth_token = self.auth_ref.auth_token
+        return client
+
+    def create_keystone(self):
+        return keystoneclient.v2_0.client.Client(username=self.username,
+                                                 password=self.password,
+                                                 tenant_name=self.tenant_name,
+                                                 tenant_id=self.tenant_id,
+                                                 auth_url=self.auth_url)
+
+    def prepare(self):
+        self.auth_ref
+        self.nova_extensions
 
 class Nova(object):
-    def __init__(self, poolsize=1, simple_list=False):
+    def __init__(self, client_factory, simple_list):
         self.__list = []
         self.__list_cond = Condition()
         self.__list_status = 'IDLE'
-        self.__novaclient_pool = NovaClientPool(poolsize)
-        if simple_list:
-            self.list = self.__simple_list
-        else:
-            self.list = self.__coalesced_list
+        self.__tls = local()
+        self.__client_factory = client_factory
+        self.__simple_show = simple_list
 
-    def __simple_list(self):
-        with self.__novaclient_pool.scoped() as client:
-            return client.servers.list()
+    @property
+    def __client(self):
+        try:
+            return self.__tls.client
+        except AttributeError:
+            self.__tls.client = self.__client_factory.create_nova()
+            return self.__tls.client
 
-    def __coalesced_list(self):
+    def show(self, instance_id):
+        if not self.__simple_show:
+            for instance in self.coalesced_list():
+                if instance.id == instance_id:
+                    return instance
+        for instance in self.simple_list():
+            if instance.id == instance_id:
+                return instance
+        raise InstanceDoesNotExistError(instance_id)
+
+    def simple_list(self):
+        return self.__client.servers.list()
+
+    def coalesced_list(self):
         with self.__list_cond:
             if self.__list_status == 'IDLE':
                 self.__list_status = 'ACTIVE'
@@ -149,10 +188,11 @@ class Nova(object):
 
         while True:
             try:
-                with self.__novaclient_pool.scoped() as client:
-                    new_list = client.servers.list()
+                new_list = self.__client.servers.list()
                 break
-            except Exception:
+            except Exception, e:
+                with PRINT_LOCK:
+                    print 'error retrieving list (%s), retrying in 0.5s' % e
                 time.sleep(0.5)
                 continue
             except:
@@ -168,36 +208,40 @@ class Nova(object):
             return self.__list
 
     def boot(self, name, image, flavor, key_name=None):
-        with self.__novaclient_pool.scoped() as client:
-            instance = client.servers.create(name=name,
-                                             image=image,
-                                             flavor=flavor,
-                                             key_name=key_name)
+        instance = self.__client.servers.create(name=name,
+                                                image=image,
+                                                flavor=flavor,
+                                                key_name=key_name)
         return Instance(self, instance.id)
 
     def live_image_start(self, name, image):
-        with self.__novaclient_pool.scoped() as client:
-            instances = client.cobalt.start_live_image(server=image, name=name)
+        instances = self.__client.cobalt.start_live_image(server=image,
+                                                          name=name)
         assert len(instances) == 1
         return Instance(self, instances[0].id)
 
     def delete(self, id):
-        with self.__novaclient_pool.scoped() as client:
-            client.servers.delete(id)
+        self.__client.servers.delete(id)
 
 class Atop(object):
-    def __init__(self, title, interval=2):
+    def __init__(self, title, interval, output_path):
         self.title = title
         self.process = None
         self.interval = interval
+        self.output_path = output_path
 
     def start(self):
         assert self.process == None
-        self.process = Popen(['sudo', 'atop', '-w', '%s.atop' % self.title,
-                                              str(self.interval)])
+        self.process = Popen(
+            ['sudo', 'atop', '-w', '%s/%s.atop' % (self.output_path,
+                                                   self.title),
+                             str(self.interval)])
 
     def stop(self):
-        self.process.send_signal(signal.SIGINT)
+        # Wow, this is weird. In Ubuntu 13.10, you can't send signals to sudo
+        # processes. Strange how the shell can though.
+        os.system('sudo kill -INT %d' % self.process.pid)
+        #self.process.send_signal(signal.SIGINT)
         self.process.wait()
 
     def __enter__(self):
@@ -221,14 +265,14 @@ class NullAtop(object):
         pass
 
 class PhaseLog(object):
-    def __init__(self, timer, title):
+    def __init__(self, timer, title, output_path):
         self.last_phase = {}
         self.in_phase = {}
         self.timer = timer
         self.lock = Lock()
         self.order = []
         self.last_in_phase = {}
-        self.data = open('%s.phases' % title, 'w')
+        self.data = open('%s/%s.phases' % (output_path, title), 'w')
 
     def __enter__(self):
         self.start()
@@ -272,16 +316,25 @@ class PhaseLog(object):
             self.last_in_phase.pop(phase, None)
             self.last_phase[experiment] = phase
 
-            with PRINT_LOCK:
-                print '%.2f' % t, '\t',
-                for phase in self.order:
-                    print phase, '%-3d' % self.in_phase[phase], 
-                print
+        self.print_progress()
+
+    def print_progress(self):
+        with self.lock, PRINT_LOCK:
+            status_line()
+            print '       RUNNING: ',
+            print 't+%.1fs' % self.timer.elapsed(), '\t',
+            for phase in self.order:
+                print phase, '%-3d' % self.in_phase[phase], 
+            print ' ',
+            sys.stdout.flush()
 
 
     def report(self):
         with PRINT_LOCK:
-            fmtstr = '%%-%ds %%-10s' % (max(map(len, self.order)))
+            # One newline to clear the status line .
+            print 
+            return
+            fmtstr = '%%-%ds %%-10s' % (max([len('PHASE')] + map(len, self.order)))
             print fmtstr % ('PHASE', 'LAST')
             for phase in self.order:
                 try:
@@ -289,8 +342,32 @@ class PhaseLog(object):
                 except KeyError:
                     last_id = '<still active or none exited>'
                 else:
-                    last_id = last.instance.id
+                    if last.instance == None:
+                        last_id = '-'
+                    else:
+                        last_id = last.instance.id
                 print fmtstr % (phase, last_id)
+
+class PeriodicCaller(Thread):
+    def __init__(self, period, func, *args, **kwargs):
+        super(PeriodicCaller, self).__init__(name='Periodic Caller')
+        self.__period = period
+        self.__callee = lambda: func(*args, **kwargs)
+        self.__stopped = False
+        self.__cond = Condition()
+
+    def run(self):
+        with self.__cond:
+            while True:
+                self.__cond.wait(timeout=self.__period)
+                if self.__stopped:
+                    break
+                self.__callee()
+
+    def stop(self):
+        with self.__cond:
+            self.__stopped = True
+            self.__cond.notify()
 
 class Phase(object):
     def __init__(self, timer):
@@ -420,24 +497,29 @@ class Experiment(object):
             time.sleep(1)
 
 class ParallelExperiment(object):
-    def __init__(self, args, atop, nova, title):
+    def __init__(self, args, atop, nova, title, output_path):
         self.args = args
         self.atop = atop
         self.nova = nova
         self.title = title
+        self.output_path = output_path
 
     def run(self):
         threads = []
         timer = Timer('total')
-        log = PhaseLog(timer, self.title)
+        log = PhaseLog(timer, self.title, self.output_path)
+        progress_thread = PeriodicCaller(1, log.print_progress)
         timer.start()
         with self.atop, log:
+            log.print_progress()
+            progress_thread.start()
             for i in range(self.args.n):
                 experiment = Experiment('%s-%s-of-%s' % (self.args.name_prefix,
                                                          i + 1, self.args.n),
                                         self.args, self.nova)
                 experiment.add_listener(log.event)
-                thread = Thread(target=experiment.run)
+                thread = Thread(target=experiment.run,
+                                name='experiment %d' % (i + 1))
                 thread.daemon = True
                 thread.start()
                 threads.append(thread)
@@ -451,6 +533,8 @@ class ParallelExperiment(object):
                         break
                 else:
                     break
+            progress_thread.stop()
+            progress_thread.join()
         log.report()
 
 def parse_argv(argv):
@@ -475,16 +559,23 @@ def parse_argv(argv):
     parser.add_argument('--simple-list', action='store_true')
     parser.add_argument('--client-pool-size', type=int, default=None)
     parser.add_argument('--no-delete', dest='delete', action='store_false')
+    parser.add_argument('--out', dest='output_path', default='.')
     return parser.parse_args(argv[1:])
 
-def clone_args(args):
-    clone = args.__class__()
-    for key, value in vars(args).iteritems():
-        setattr(clone, key, value)
-    return clone
+def setup_faulthandler(args):
+    try:
+        import faulthandler
+    except ImportError:
+        sys.stderr.write('running without faulthandler\n')
+        return
+    else:
+        faulthandler.enable()
+        faulthandler.register(signal.SIGINT)
 
 def main(argv):
     args = parse_argv(argv)
+
+    setup_faulthandler(args)
 
     if args.client_pool_size == None:
         args.client_pool_size = args.n
@@ -496,12 +587,23 @@ def main(argv):
     title = ('%s-%s@%s' % (args.op, args.n, timestamp())).replace(' ', '-')
 
     if args.atop:
-        atop = Atop(title, args.atop_interval)
+        atop = Atop(title, args.atop_interval, args.output_path)
     else:
         atop = NullAtop()
 
-    nova = Nova(poolsize=args.client_pool_size, simple_list=args.simple_list)
-    experiment = ParallelExperiment(args, atop=atop, nova=nova, title=title)
+    client_factory =\
+        SharedTokenClientFactory(username=os.environ['OS_USERNAME'],
+                                 password=os.environ['OS_PASSWORD'],
+                                 tenant_name=os.environ.get('OS_TENANT_NAME'),
+                                 tenant_id=os.environ.get('OS_TENANT_ID'),
+                                 auth_url=os.environ['OS_AUTH_URL'])
+    status_line('AUTHENTICATING: ...')
+    sys.stdout.flush()
+    client_factory.prepare()
+
+    nova = Nova(client_factory, simple_list=args.simple_list)
+    experiment = ParallelExperiment(args, atop=atop, nova=nova, title=title,
+                                    output_path=args.output_path)
     experiment.run()
 
 if __name__ == '__main__':

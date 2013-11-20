@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -x
+set -e
 
 if test $# -ne 1; then
     echo 'usage: $0 TITLE' 2>&1;
