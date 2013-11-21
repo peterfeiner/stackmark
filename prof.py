@@ -73,6 +73,16 @@ class Instance(object):
                 return addrs[0]
         raise InstanceHasNoIpError(self.__id)
 
+    def get_ip(self, network):
+        if network is None:
+            return self.any_ip()
+        else:
+            ips = self.__get().networks.get(network, [])
+            try:
+                return ips[0]
+            except IndexError:
+                raise InstanceHasNoIpError(self.__id)
+
     def get_status(self):
         return self.__get().status
 
@@ -386,6 +396,10 @@ class Experiment(object):
         self.nova = nova
         self.phases = []
         self.instance = None
+        if args.netns is not None:
+            self.netns_exec = ['sudo', 'ip', 'netns', 'exec', args.netns]
+        else:
+            self.netns_exec = []
 
     def add_listener(self, listener):
         self.listeners.append(listener)
@@ -472,10 +486,15 @@ class Experiment(object):
     def __check_nmap(self):
         self.start_phase('nmap')
 
+    def __instance_ip(self):
+        return self.instance.get_ip(self.args.network)
+
     def __check_ping(self):
         self.start_phase('ping')
         while True:
-            p = Popen(['ping', '-c', '1', self.instance.any_ip()],
+            cmd = self.netns_exec + ['ping', '-c', '1', self.__instance_ip()]
+            p = Popen(self.netns_exec +
+                      ['ping', '-c', '1', self.__instance_ip()],
                       stdout=DEV_NULL)
             if p.wait() == 0:
                 break
@@ -483,12 +502,13 @@ class Experiment(object):
     def __check_ssh(self):
         self.start_phase('ssh')
         while True:
-            p = Popen(['ssh',
+            p = Popen(self.netns_exec +
+                      ['ssh',
                        '-l', self.args.check_ssh_user,
                        '-o', 'UserKnownHostsFile=/dev/null',
                        '-o', 'StrictHostKeyChecking=no',
                        '-o', 'PasswordAuthentication=no',
-                       self.instance.any_ip(),
+                       self.__instance_ip(),
                        self.args.check_ssh_command],
                        stdout=DEV_NULL,
                        stderr=DEV_NULL)
@@ -560,6 +580,8 @@ def parse_argv(argv):
     parser.add_argument('--client-pool-size', type=int, default=None)
     parser.add_argument('--no-delete', dest='delete', action='store_false')
     parser.add_argument('--out', dest='output_path', default='.')
+    parser.add_argument('--netns', default=None)
+    parser.add_argument('--network', default=None)
     return parser.parse_args(argv[1:])
 
 def setup_faulthandler(args):
