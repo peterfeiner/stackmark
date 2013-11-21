@@ -8,16 +8,20 @@ if __name__ == '__main__':
 
     in_phase = dict([(phase, 0) for phase in sys.argv[2:]])
 
+    def p(t):
+        print '%.10f' % float(t),
+        for phase in sys.argv[2:]:
+            print in_phase[phase],
+        print
+
     for line in open(sys.argv[1]):
         line = line.strip()
         t, event = line.split('\t', 1)
 
         if t != last_t:
             if last_t != None:
-                print last_t,
-                for phase in sys.argv[2:]:
-                    print in_phase[phase],
-                print
+                p(last_t)
+            p(t)
             last_t = t
 
         if event.startswith('start-'):
@@ -35,7 +39,4 @@ if __name__ == '__main__':
         if phase in in_phase:
             in_phase[phase] += inc
 
-    print t,
-    for phase in sys.argv[2:]:
-        print in_phase[phase],
-    print
+    p(t)

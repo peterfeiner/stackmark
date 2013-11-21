@@ -5,7 +5,7 @@ phases_file = TITLE . '.phases'
 
 set macros
 #set term svg size 800, 300
-set term pngcairo size 600, 250 font 'Arial,10'
+set term pngcairo size 800, 400 font 'Arial,10'
 set output TITLE . '.png'
 set style data lines
 
@@ -34,43 +34,38 @@ utilization(total, idle) = (total - idle) / total
 
 cpu_cmd = '< atop -r ' . TITLE . '.atop -PCPU | sed -n "0,/^SEP$/d;p" | grep -v SEP'
 dsk_cmd = '< atop -r ' . TITLE . '.atop -PDSK | sed -n "0,/^SEP$/d;p" | grep -v SEP | grep sda'
-boot_cmd = '< grep "\<in-boot\>" ' . TITLE . '.phases'
-ping_cmd = '< grep "\<in-ping\>" ' . TITLE . '.phases'
-ssh_cmd = '< grep "\<in-ssh\>" ' . TITLE . '.phases'
-delete_cmd = '< grep "\<in-delete\>" ' . TITLE . '.phases'
 
-merge_cmd = '< ./merge-phases.py ' . TITLE . '.phases boot_api boot ping ssh delete_api delete fin'
+set style line 100 lt 1 lw 2 pt 0 linecolor rgb "#4CEAFC"
+set style line 101 lt 1 lw 2 pt 0 linecolor rgb "#7C40D6"
 
-
-#set style line 8 lt 1 lw 2 pt 0 linecolor rgb "#d77fb3"
-set style line 7 lt 1 lw 2 pt 0 linecolor rgb "#4CEAFC"
-set style line 6 lt 1 lw 2 pt 0 linecolor rgb "#7C40D6"
-set style line 5 lt 1 lw 1 pt 0 linecolor rgb "#e8a55a"
-set style line 4 lt 1 lw 1 pt 0 linecolor rgb "#599ad3"
-set style line 3 lt 1 lw 1 pt 0 linecolor rgb "#79c36a"
-set style line 2 lt 1 lw 1 pt 0 linecolor rgb "#dc545e"
-set style line 1 lt 1 lw 1 pt 0 linecolor rgb "#909090"
-
-plot \
-     merge_cmd \
-     using ($1):(($2 + $3 + $4 + $5 + $6 + $7 + $8) / N) \
-     title 'deleted / N' with boxes fs solid ls 1, \
-     "" \
-     using ($1):(($2 + $3 + $4 + $5 + $6 + $7) / N) \
-     title 'deleting / N' with boxes fs solid ls 2, \
-     "" \
-     using ($1):(($2 + $3 + $4 + $5) / N) \
-     title 'sshing / N' with boxes fs solid ls 3, \
-     "" \
-     using ($1):(($2 + $3 + $4) / N) \
-     title 'pinging / N' with boxes fs solid ls 4, \
-     "" \
-     using ($1):(($2 + $3) / N) \
-     title 'creating / N' with boxes fs solid ls 5, \
-     cpu_cmd \
-     using ($3 - start_time):(utilization($6 * $7 * $8, $12)) \
-     title 'U(CPU)' ls 6, \
-     dsk_cmd \
-     using ($3 - start_time):($8 / ($6 * 1000)) \
-     title 'U(DSK)' ls 7, \
-     '< true' using 1:2
+# From http://download.oracle.com/tech/blaf/specs/colorpalette.html.
+set style line 1  lt 1 lw 1 pt 0 linecolor rgb "#336699"
+set style line 2  lt 1 lw 1 pt 0 linecolor rgb "#99CCFF"
+set style line 3  lt 1 lw 1 pt 0 linecolor rgb "#999933"
+set style line 4  lt 1 lw 1 pt 0 linecolor rgb "#666699"
+set style line 5  lt 1 lw 1 pt 0 linecolor rgb "#CC9933"
+set style line 6  lt 1 lw 1 pt 0 linecolor rgb "#006666"
+set style line 7  lt 1 lw 1 pt 0 linecolor rgb "#3399FF"
+set style line 8  lt 1 lw 1 pt 0 linecolor rgb "#993300"
+set style line 9  lt 1 lw 1 pt 0 linecolor rgb "#CCCC99"
+set style line 10 lt 1 lw 1 pt 0 linecolor rgb "#666666"
+set style line 11 lt 1 lw 1 pt 0 linecolor rgb "#FFCC66"
+set style line 12 lt 1 lw 1 pt 0 linecolor rgb "#6699CC"
+set style line 13 lt 1 lw 1 pt 0 linecolor rgb "#663366"
+set style line 14 lt 1 lw 1 pt 0 linecolor rgb "#9999CC"
+set style line 15 lt 1 lw 1 pt 0 linecolor rgb "#CCCCCC"
+set style line 16 lt 1 lw 1 pt 0 linecolor rgb "#669999"
+set style line 17 lt 1 lw 1 pt 0 linecolor rgb "#CCCC66"
+set style line 18 lt 1 lw 1 pt 0 linecolor rgb "#CC6600"
+set style line 19 lt 1 lw 1 pt 0 linecolor rgb "#9999FF"
+set style line 20 lt 1 lw 1 pt 0 linecolor rgb "#0066CC"
+set style line 21 lt 1 lw 1 pt 0 linecolor rgb "#99CCCC"
+set style line 22 lt 1 lw 1 pt 0 linecolor rgb "#999999"
+set style line 23 lt 1 lw 1 pt 0 linecolor rgb "#FFCC00"
+set style line 24 lt 1 lw 1 pt 0 linecolor rgb "#009999"
+set style line 25 lt 1 lw 1 pt 0 linecolor rgb "#99CC33"
+set style line 26 lt 1 lw 1 pt 0 linecolor rgb "#FF9900"
+set style line 27 lt 1 lw 1 pt 0 linecolor rgb "#999966"
+set style line 28 lt 1 lw 1 pt 0 linecolor rgb "#66CCCC"
+set style line 29 lt 1 lw 1 pt 0 linecolor rgb "#339966"
+set style line 30 lt 1 lw 1 pt 0 linecolor rgb "#CCCC33"

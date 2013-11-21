@@ -61,6 +61,14 @@ class Instance(object):
     def id(self):
         return self.__id
 
+    @property
+    def __path(self):
+        return os.path.join(self.__nova.instances_path, self.__id)
+
+    @property
+    def console_log_path(self):
+        return os.path.join(self.__path, 'console.log')
+
     def delete(self):
         self.__nova.delete(self.__id)
 
@@ -152,13 +160,14 @@ class SharedTokenClientFactory(object):
         self.nova_extensions
 
 class Nova(object):
-    def __init__(self, client_factory, simple_list):
+    def __init__(self, client_factory, simple_list, instances_path):
         self.__list = []
         self.__list_cond = Condition()
         self.__list_status = 'IDLE'
         self.__tls = local()
         self.__client_factory = client_factory
         self.__simple_show = simple_list
+        self.instances_path = instances_path
 
     @property
     def __client(self):
@@ -386,6 +395,9 @@ class Phase(object):
         self.duration = timer.elapsed()
         self.end = self.start + self.duration
 
+class PhaseError(Exception):
+    pass
+
 class Experiment(object):
     def __init__(self, name, args, nova):
         self.args = args
@@ -396,6 +408,7 @@ class Experiment(object):
         self.nova = nova
         self.phases = []
         self.instance = None
+        self.console_tail = None
         if args.netns is not None:
             self.netns_exec = ['sudo', 'ip', 'netns', 'exec', args.netns]
         else:
@@ -416,21 +429,34 @@ class Experiment(object):
         self.phase = name
         self.event()
 
+    def phase_error(self, msg):
+        raise PhaseError('Error during phase %s for instance %s: %s' % 
+                         (self.phase, self.instance.id, msg))
+
     def run(self):
-        self.__create()
-        if self.args.check_dhcp_hosts:
-            self.__check_dhcp_hosts()
-        if self.args.check_iptables:
-            self.__check_iptables()
-        if self.args.check_ping:
-            self.__check_ping()
-        if self.args.check_nmap:
-            self.__check_nmap()
-        if self.args.check_ssh:
-            self.__check_ssh()
-        if self.args.delete:
-            self.__delete()
-        self.start_phase('fin')
+        try:
+            self.__create()
+            if self.args.check_dhcp_hosts:
+                self.__check_dhcp_hosts()
+            if self.args.check_iptables:
+                self.__check_iptables()
+            if self.args.check_console_boot:
+                self.__check_console_boot()
+            if self.args.check_console_dhcp:
+                self.__check_console_dhcp()
+            if self.args.check_ping:
+                self.__check_ping()
+            if self.args.check_nmap:
+                self.__check_nmap()
+            if self.args.check_ssh:
+                self.__check_ssh()
+            if self.args.delete:
+                self.__delete()
+            self.start_phase('fin')
+        finally:
+            if self.console_tail != None:
+                self.console_tail.kill()
+                self.console_tail.wait()
 
     def __boot_op(self, name):
         return self.nova.boot(name,
@@ -482,6 +508,45 @@ class Experiment(object):
             if self.instance.any_ip() in out:
                 break
             time.sleep(1)
+
+    def __check_console(self, string):
+        if self.console_tail == None:
+            self.console_tail =\
+                Popen(['tail', '-c', '+0',
+                               '-f', self.instance.console_log_path],
+                      stdout=PIPE)
+        while True:
+            line = self.console_tail.stdout.readline()
+            if line == '':
+                self.phase_error('%s not in console log %s' %
+                                 (string, self.instance.console_log_path))
+            if string in line:
+                break
+
+    def __check_console_boot(self):
+        self.start_phase('console_boot')
+        self.__check_console('initramfs: up at')
+
+    def __check_console_dhcp(self):
+        self.start_phase('console_dhcp')
+        self.__check_console(self.__instance_ip())
+
+    def __check_dhcp_console(self):
+        self.start_phase('dhcp')
+        ip = self.__instance_ip()
+        p = Popen(['tail', '-c', '+0', '-f', self.instance.console_log_path],
+                  stdout=PIPE)
+        try:
+            while True:
+                line = p.stdout.readline()
+                if line == '':
+                    self.phase_error('ip address %s not in console log %s' %
+                                    (ip, self.instance.console_log_path))
+                if ip in line:
+                    break
+        finally:
+            p.kill()
+            p.wait()
 
     def __check_nmap(self):
         self.start_phase('nmap')
@@ -563,10 +628,15 @@ def parse_argv(argv):
     parser.add_argument('n', type=int, default=1, nargs='?')
     parser.add_argument('--image',
                         default='precise-server-cloudimg-amd64-disk1.img')
+    parser.add_argument('--nova-instances-path', type=str, default=None)
     parser.add_argument('--flavor', default='m1.tiny')
     parser.add_argument('--key-name', default=None)
     parser.add_argument('--name-prefix', default='prof')
     parser.add_argument('--check-dhcp-hosts', type=str, default=None)
+    parser.add_argument('--check-console-dhcp', action='store_true',
+                        help='note: requires --nova-instances-path')
+    parser.add_argument('--check-console-boot', action='store_true',
+                        help='note: requires --nova-instances-path')
     parser.add_argument('--check-iptables', action='store_true')
     parser.add_argument('--check-ssh', action='store_true')
     parser.add_argument('--check-ssh-user', default='ubuntu')
@@ -582,7 +652,24 @@ def parse_argv(argv):
     parser.add_argument('--out', dest='output_path', default='.')
     parser.add_argument('--netns', default=None)
     parser.add_argument('--network', default=None)
-    return parser.parse_args(argv[1:])
+
+    args = parser.parse_args(argv[1:])
+
+    def arg_error(msg):
+        sys.stderr.write('%s: error: %s\n' % (sys.argv[0], msg))
+
+    if not args.nova_instances_path:
+        require = []
+        for arg in ['check_console_dhcp', 'check_console_boot']:
+            if args.getattr(arg):
+                require.append(arg)
+        if len(require) > 0:
+            arg_error('need --nova-instances-path for: ' %
+                      ', '.join(['--%s' % arg.replace('_', '-')
+                                 for arg in require]))
+            sys.exit(1)
+
+    return args
 
 def setup_faulthandler(args):
     try:
@@ -623,7 +710,9 @@ def main(argv):
     sys.stdout.flush()
     client_factory.prepare()
 
-    nova = Nova(client_factory, simple_list=args.simple_list)
+    nova = Nova(client_factory,
+                simple_list=args.simple_list,
+                instances_path=args.nova_instances_path)
     experiment = ParallelExperiment(args, atop=atop, nova=nova, title=title,
                                     output_path=args.output_path)
     experiment.run()

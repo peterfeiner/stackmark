@@ -3,7 +3,7 @@
 set -e
 
 for x in $(find . -name '*.atop'); do
-    ./plot.sh $(dirname $x)/$(basename $x .atop) &
+    ./plot.py $(dirname $x)/$(basename $x .atop) &
 done
 
 wait
@@ -13,7 +13,7 @@ cat > index.html << EOF
     <body>
 EOF
 
-for x in $(find . -name '*.png' | sort); do
+for x in $(find data -name '*.png' | sort -t @ -k 2 -r); do
 cat >> index.html << EOF
         <img src="$x"><br>
 EOF
