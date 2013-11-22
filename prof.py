@@ -9,6 +9,7 @@ import os
 import signal
 import sys
 import time
+import shlex
 
 from subprocess import Popen, PIPE
 from threading import Thread, Lock, Condition, local
@@ -622,54 +623,96 @@ class ParallelExperiment(object):
             progress_thread.join()
         log.report()
 
-def parse_argv(argv):
-    parser = argparse.ArgumentParser()
-    parser.add_argument('op', choices=['boot', 'launch'])
-    parser.add_argument('n', type=int, default=1, nargs='?')
-    parser.add_argument('--image',
-                        default='precise-server-cloudimg-amd64-disk1.img')
-    parser.add_argument('--nova-instances-path', type=str, default=None)
-    parser.add_argument('--flavor', default='m1.tiny')
-    parser.add_argument('--key-name', default=None)
-    parser.add_argument('--name-prefix', default='prof')
-    parser.add_argument('--check-dhcp-hosts', type=str, default=None)
-    parser.add_argument('--check-console-dhcp', action='store_true',
-                        help='note: requires --nova-instances-path')
-    parser.add_argument('--check-console-boot', action='store_true',
-                        help='note: requires --nova-instances-path')
-    parser.add_argument('--check-iptables', action='store_true')
-    parser.add_argument('--check-ssh', action='store_true')
-    parser.add_argument('--check-ssh-user', default='ubuntu')
-    parser.add_argument('--check-ssh-command', default='true')
-    parser.add_argument('--check-ping', action='store_true')
-    parser.add_argument('--check-nmap', type=int, default=None)
-    parser.add_argument('--atop', action='store_true')
-    parser.add_argument('--atop-interval', type=int, default=2)
-    parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--simple-list', action='store_true')
-    parser.add_argument('--client-pool-size', type=int, default=None)
-    parser.add_argument('--no-delete', dest='delete', action='store_false')
-    parser.add_argument('--out', dest='output_path', default='.')
-    parser.add_argument('--netns', default=None)
-    parser.add_argument('--network', default=None)
+class ArgumentLoader(object):
 
-    args = parser.parse_args(argv[1:])
+    def __init__(self):
+        self.__option_parser = self.__create_option_parser()
+        self.__arg_parser = self.__create_arg_parser()
+        self.__args = argparse.Namespace()
 
-    def arg_error(msg):
-        sys.stderr.write('%s: error: %s\n' % (sys.argv[0], msg))
+    def add_argv(self, argv):
+        '''Adds options from command line.'''
+        self.__arg_parser.parse_args(argv[1:], self.__args)
 
-    if not args.nova_instances_path:
-        require = []
-        for arg in ['check_console_dhcp', 'check_console_boot']:
-            if args.getattr(arg):
-                require.append(arg)
-        if len(require) > 0:
-            arg_error('need --nova-instances-path for: ' %
-                      ', '.join(['--%s' % arg.replace('_', '-')
-                                 for arg in require]))
-            sys.exit(1)
+    def add_rc(self, path):
+        '''Adds path if it exists. Only parses optional arguments.'''
+        try:
+            fp = open(path)
+        except IOError:
+            return
+        else:
+            with fp:
+                i = 0
+                for line in fp:
+                    i += 1
+                    line = line.partition('#')[0]
+                    try:
+                        self.__option_parser.parse_args(shlex.split(line),
+                                                        self.__args)
+                    except SystemExit:
+                        sys.stderr.write('in %s:%d:\n' %
+                                         (os.path.abspath(path), i))
+                        sys.stderr.write('    %s\n' % line.partition('\n')[0])
+                        raise
 
-    return args
+    def load(self):
+        def arg_error(msg):
+            sys.stderr.write('%s: error: %s\n' % (sys.argv[0], msg))
+
+        if not self.__args.nova_instances_path:
+            for var in ['check_console_dhcp', 'check_console_boot']:
+                if not self.__args.getattr(var):
+                    arg = '--%s' % arg.replace('_', '-')
+                    arg_error('%s: requires --nova-instances-path' % arg)
+                    sys.exit(1)
+
+        return self.__args
+
+    @classmethod
+    def __create_arg_parser(cls):
+        parser = cls.__create_option_parser()
+        parser.add_argument('op', choices=['boot', 'launch'])
+        parser.add_argument('n', type=int, default=1)
+        return parser
+
+    @classmethod
+    def __create_option_parser(cls):
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--image',
+                            default='precise-server-cloudimg-amd64-disk1.img')
+        parser.add_argument('--nova-instances-path', type=str, default=None)
+        parser.add_argument('--flavor', default='m1.tiny')
+        parser.add_argument('--key-name', default=None)
+        parser.add_argument('--name-prefix', default='prof')
+        parser.add_argument('--check-dhcp-hosts', type=str, default=None)
+        parser.add_argument('--check-console-dhcp', action='store_true',
+                            help='note: requires --nova-instances-path')
+        parser.add_argument('--check-console-boot', action='store_true',
+                            help='note: requires --nova-instances-path')
+        parser.add_argument('--check-iptables', action='store_true')
+        parser.add_argument('--check-ssh', action='store_true')
+        parser.add_argument('--check-ssh-user', default='ubuntu')
+        parser.add_argument('--check-ssh-command', default='true')
+        parser.add_argument('--check-ping', action='store_true')
+        parser.add_argument('--check-nmap', type=int, default=None)
+        parser.add_argument('--atop', action='store_true')
+        parser.add_argument('--atop-interval', type=int, default=2)
+        parser.add_argument('--debug', action='store_true')
+        parser.add_argument('--simple-list', action='store_true')
+        parser.add_argument('--client-pool-size', type=int, default=None)
+        parser.add_argument('--no-delete', dest='delete', action='store_false')
+        parser.add_argument('--out', dest='output_path', default='.')
+        parser.add_argument('--netns', default=None)
+        parser.add_argument('--network', default=None)
+        return parser
+
+def load_args():
+    loader = ArgumentLoader()
+    if 'HOME' in os.environ:
+        loader.add_rc(os.path.join(os.environ['HOME'], '.smrc'))
+    loader.add_rc('.smrc')
+    loader.add_argv(sys.argv)
+    return loader.load()
 
 def setup_faulthandler(args):
     try:
@@ -681,8 +724,8 @@ def setup_faulthandler(args):
         faulthandler.enable()
         faulthandler.register(signal.SIGINT)
 
-def main(argv):
-    args = parse_argv(argv)
+def main():
+    args = load_args()
 
     setup_faulthandler(args)
 
@@ -718,4 +761,4 @@ def main(argv):
     experiment.run()
 
 if __name__ == '__main__':
-    main(sys.argv)
+    main()
