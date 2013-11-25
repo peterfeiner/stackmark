@@ -10,8 +10,11 @@ Region = namedtuple('Region', 'title phases')
 
 regions = [
     Region('creating', ['boot_api', 'boot']),
+    Region('ovs-vsctl', ['syslog_ovsvsctl']),
     Region('boot', ['console_boot']),
-    Region('dhcp', ['console_dhcp']),
+    Region('iptables', ['iptables']),
+    Region('dhcp-host', ['syslog_dhcp']),
+    Region('dhcp-guest', ['console_dhcp']),
     Region('pinging', ['ping']),
     Region('sshing', ['ssh']),
     Region('deleting', ['delete_api', 'delete']),

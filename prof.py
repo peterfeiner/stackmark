@@ -6,12 +6,14 @@ import json
 import logging
 import os
 import os
+import re
 import signal
 import sys
 import time
 import shlex
 
-from subprocess import Popen, PIPE
+from collections import namedtuple
+from subprocess import Popen, PIPE, check_output
 from threading import Thread, Lock, Condition, local
 
 import keystoneclient.v2_0.client
@@ -53,50 +55,74 @@ class InstanceHasNoIpError(Exception):
         Exception.__init__(self, 'Instance with id %s has no ip address.' %
                            instance_id)
 
+
+NetworkPort = namedtuple('NetworkPort', 'network ip mac type')
+
 class Instance(object):
     def __init__(self, nova, id):
         self.__nova = nova
-        self.__id = id
-
-    @property
-    def id(self):
-        return self.__id
+        self.id = id
 
     @property
     def __path(self):
-        return os.path.join(self.__nova.instances_path, self.__id)
+        return os.path.join(self.__nova.instances_path, self.id)
 
     @property
     def console_log_path(self):
         return os.path.join(self.__path, 'console.log')
 
     def delete(self):
-        self.__nova.delete(self.__id)
+        self.__nova.delete(self.id)
 
     def __get(self):
-        return self.__nova.show(self.__id)
+        return self.__nova.show(self.id)
 
-    def any_ip(self):
-        for addrs in self.__get().networks.itervalues():
-            if len(addrs) > 0:
-                return addrs[0]
-        raise InstanceHasNoIpError(self.__id)
+    @property
+    def net2ports(self):
+        net2ports = {}
+        for network, addresses in self.__get().addresses.iteritems():
+            ports = []
+            net2ports[network] = ports
+            for address in addresses:
+                ports.append(NetworkPort(network, address['addr'],
+                                         address['OS-EXT-IPS-MAC:mac_addr'],
+                                         type=address['OS-EXT-IPS:type']))
+        return net2ports
+
+    @property
+    def ports(self):
+        ports = []
+        for netports in self.net2ports.itervalues():
+            ports.extend(netports)
+        return ports
+
+    def get_port(self, network):
+        if network is None:
+            ports = self.ports
+        else:
+            ports = self.net2ports[network]
+        if len(ports) == 0:
+            raise InstanceHasNoIpError(self.id)
+        return ports[0]
+
+    INTERFACE_ID_RE=re.compile('<parameters interfaceid=\'([a-z0-9-]*)\'/>')
+
+    def get_port_uuid(self, network):
+        out = check_output(['virsh', 'dumpxml', self.id])
+        match = self.INTERFACE_ID_RE.search(out)
+        return match.groups()[0]
+
+    def get_mac(self, network):
+        return self.get_port(network).mac
 
     def get_ip(self, network):
-        if network is None:
-            return self.any_ip()
-        else:
-            ips = self.__get().networks.get(network, [])
-            try:
-                return ips[0]
-            except IndexError:
-                raise InstanceHasNoIpError(self.__id)
+        return self.get_port(network).ip
 
     def get_status(self):
         return self.__get().status
 
     def __repr__(self):
-        return 'Instance(%r, %r)' % (self.__nova, self.__id)
+        return 'Instance(%r, %r)' % (self.__nova, self.id)
 
 class SharedTokenClientFactory(object):
 
@@ -255,7 +281,8 @@ class Atop(object):
         self.process = Popen(
             ['sudo', 'atop', '-w', '%s/%s.atop' % (self.output_path,
                                                    self.title),
-                             str(self.interval)])
+                             str(self.interval)],
+            close_fds=True)
 
     def stop(self):
         # Wow, this is weird. In Ubuntu 13.10, you can't send signals to sudo
@@ -336,7 +363,7 @@ class PhaseLog(object):
             self.last_in_phase.pop(phase, None)
             self.last_phase[experiment] = phase
 
-        self.print_progress()
+        #self.print_progress()
 
     def print_progress(self):
         with self.lock, PRINT_LOCK:
@@ -350,6 +377,7 @@ class PhaseLog(object):
 
 
     def report(self):
+        self.print_progress()
         with PRINT_LOCK:
             # One newline to clear the status line .
             print 
@@ -399,6 +427,24 @@ class Phase(object):
 class PhaseError(Exception):
     pass
 
+class Tail(object):
+    def __init__(self, path, from_beginning=False):
+        self.path = path
+        args = ['tail']
+        if from_beginning:
+            args.extend(['-c', '+0'])
+        args.extend(['-f', path])
+        self.__p = Popen(args, stdout=PIPE, close_fds=True)
+
+    def readline(self):
+        return self.__p.stdout.readline()
+
+    def stop(self):
+        self.__p.kill()
+        self.__p.wait()
+        self.__p.stdout.close()
+        self.__p = None
+
 class Experiment(object):
     def __init__(self, name, args, nova):
         self.args = args
@@ -410,6 +456,14 @@ class Experiment(object):
         self.phases = []
         self.instance = None
         self.console_tail = None
+
+        for name in vars(self.args):
+            if name.startswith('check_syslog') and getattr(self.args, name):
+                self.syslog_tail = Tail('/var/log/syslog', False)
+                break
+        else:
+            self.syslog_tail = None
+
         if args.netns is not None:
             self.netns_exec = ['sudo', 'ip', 'netns', 'exec', args.netns]
         else:
@@ -439,10 +493,14 @@ class Experiment(object):
             self.__create()
             if self.args.check_dhcp_hosts:
                 self.__check_dhcp_hosts()
-            if self.args.check_iptables:
-                self.__check_iptables()
+            if self.args.check_syslog_ovsvsctl:
+                self.__check_syslog_ovsvsctl()
             if self.args.check_console_boot:
                 self.__check_console_boot()
+            if self.args.check_iptables:
+                self.__check_iptables()
+            if self.args.check_syslog_dhcp:
+                self.__check_syslog_dhcp()
             if self.args.check_console_dhcp:
                 self.__check_console_dhcp()
             if self.args.check_ping:
@@ -456,8 +514,9 @@ class Experiment(object):
             self.start_phase('fin')
         finally:
             if self.console_tail != None:
-                self.console_tail.kill()
-                self.console_tail.wait()
+                self.console_tail.stop()
+            if self.syslog_tail != None:
+                self.syslog_tail.stop()
 
     def __boot_op(self, name):
         return self.nova.boot(name,
@@ -495,59 +554,58 @@ class Experiment(object):
 
     def __check_dhcp_hosts(self):
         self.start_phase('dhcp_hosts')
+        ip = self.__instance_ip()
         while True:
             with open(self.args.check_dhcp_hosts) as f:
-                if self.instance.any_ip() in f.read():
+                if ip in f.read():
                     break
             time.sleep(1)
 
     def __check_iptables(self):
         self.start_phase('iptables')
+        prefix = self.__instance_port_uuid_prefix()
+        regex = re.compile('%s.*--[ds]port 6[78]' % re.escape(prefix))
         while True:
-            p = Popen(['sudo', 'iptables-save'], stdout=PIPE)
-            out, err = p.communicate()
-            if self.instance.any_ip() in out:
+            out = check_output(['sudo', 'iptables-save'])
+            if regex.search(out):
                 break
             time.sleep(1)
 
-    def __check_console(self, string):
+    def __check_tail(self, tail, regex):
+        if isinstance(regex, basestring):
+            regex = re.compile(regex)
+        while True:
+            line = tail.readline()
+            if line == '':
+                self.phase_error('%s not in %s' % (regex.pattern, tail.path))
+            if regex.search(line):
+                break
+
+    def __check_console(self, regex):
         if self.console_tail == None:
             self.console_tail =\
-                Popen(['tail', '-c', '+0',
-                               '-f', self.instance.console_log_path],
-                      stdout=PIPE)
-        while True:
-            line = self.console_tail.stdout.readline()
-            if line == '':
-                self.phase_error('%s not in console log %s' %
-                                 (string, self.instance.console_log_path))
-            if string in line:
-                break
+                Tail(os.path.join(self.instance.console_log_path), True)
+        self.__check_tail(self.console_tail, regex)
+
+    def __check_syslog(self, regex):
+        self.__check_tail(self.syslog_tail, regex)
+
+    def __check_syslog_dhcp(self):
+        self.start_phase('syslog_dhcp')
+        self.__check_syslog('DHCPDISCOVER.*%s' %
+                            re.escape(self.__instance_mac()))
+
+    def __check_syslog_ovsvsctl(self):
+        self.start_phase('syslog_ovsvsctl')
+        self.__check_syslog('ovs-vsctl.*%s' % re.escape(self.__instance_mac()))
 
     def __check_console_boot(self):
         self.start_phase('console_boot')
-        self.__check_console('initramfs: up at')
+        self.__check_console('Sending discover...')
 
     def __check_console_dhcp(self):
         self.start_phase('console_dhcp')
-        self.__check_console(self.__instance_ip())
-
-    def __check_dhcp_console(self):
-        self.start_phase('dhcp')
-        ip = self.__instance_ip()
-        p = Popen(['tail', '-c', '+0', '-f', self.instance.console_log_path],
-                  stdout=PIPE)
-        try:
-            while True:
-                line = p.stdout.readline()
-                if line == '':
-                    self.phase_error('ip address %s not in console log %s' %
-                                    (ip, self.instance.console_log_path))
-                if ip in line:
-                    break
-        finally:
-            p.kill()
-            p.wait()
+        self.__check_console(re.escape(self.__instance_ip()))
 
     def __check_nmap(self):
         self.start_phase('nmap')
@@ -555,13 +613,20 @@ class Experiment(object):
     def __instance_ip(self):
         return self.instance.get_ip(self.args.network)
 
+    def __instance_mac(self):
+        return self.instance.get_mac(self.args.network)
+
+    def __instance_port_uuid_prefix(self):
+        return self.instance.get_port_uuid(self.args.network).partition('-')[0]
+
     def __check_ping(self):
         self.start_phase('ping')
         while True:
             cmd = self.netns_exec + ['ping', '-c', '1', self.__instance_ip()]
             p = Popen(self.netns_exec +
                       ['ping', '-c', '1', self.__instance_ip()],
-                      stdout=DEV_NULL)
+                      stdout=DEV_NULL,
+                      close_fds=True)
             if p.wait() == 0:
                 break
 
@@ -577,7 +642,8 @@ class Experiment(object):
                        self.__instance_ip(),
                        self.args.check_ssh_command],
                        stdout=DEV_NULL,
-                       stderr=DEV_NULL)
+                       stderr=DEV_NULL,
+                       close_fds=True)
             if p.wait() == 0:
                 break
             time.sleep(1)
@@ -689,6 +755,8 @@ class ArgumentLoader(object):
                             help='note: requires --nova-instances-path')
         parser.add_argument('--check-console-boot', action='store_true',
                             help='note: requires --nova-instances-path')
+        parser.add_argument('--check-syslog-ovsvsctl', action='store_true')
+        parser.add_argument('--check-syslog-dhcp', action='store_true')
         parser.add_argument('--check-iptables', action='store_true')
         parser.add_argument('--check-ssh', action='store_true')
         parser.add_argument('--check-ssh-user', default='ubuntu')
