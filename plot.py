@@ -9,7 +9,12 @@ import os
 Region = namedtuple('Region', 'title phases')
 
 regions = [
-    Region('creating', ['boot_api', 'boot']),
+    Region('create-api', ['create:api']),
+    Region('pre-sched', ['create:none']),
+    Region('sched', ['create:scheduling']),
+    Region('netwk', ['create:networking']),
+    Region('bdmap', ['create:block_device_mapping']),
+    Region('spawn', ['create:spawning']),
     Region('ovs-vsctl', ['syslog_ovsvsctl']),
     Region('boot', ['console_boot']),
     Region('iptables', ['iptables']),
@@ -37,7 +42,7 @@ for i in range(len(regions)):
     plot.write('    using ($1):((')
     plot.write(' + '.join(map(lambda c: '$%s' % (c + 2), range(column_count))))
     plot.write(') / N)\\\n')
-    plot.write('    title "%s / N" with boxes fs solid ls %d,\\\n' %
+    plot.write('    title "%s" with boxes fs solid ls %d,\\\n' %
                (region.title, i + 1))
     column_count -= len(region.phases)
 

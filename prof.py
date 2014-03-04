@@ -61,6 +61,7 @@ NetworkPort = namedtuple('NetworkPort', 'network ip mac type')
 class Instance(object):
     def __init__(self, nova, id):
         self.__nova = nova
+        self.__server_data = None
         self.id = id
 
     @property
@@ -74,13 +75,19 @@ class Instance(object):
     def delete(self):
         self.__nova.delete(self.id)
 
-    def __get(self):
-        return self.__nova.show(self.id)
+    @property
+    def __server(self):
+        if self.__server_data == None:
+            self.__server_data = self.__nova.show(self.id)
+        return self.__server_data
+
+    def refetch(self):
+        self.__server_data = None
 
     @property
     def net2ports(self):
         net2ports = {}
-        for network, addresses in self.__get().addresses.iteritems():
+        for network, addresses in self.__server.addresses.iteritems():
             ports = []
             net2ports[network] = ports
             for address in addresses:
@@ -96,6 +103,14 @@ class Instance(object):
             ports.extend(netports)
         return ports
 
+    @property
+    def status(self):
+        return self.__server.status
+
+    @property
+    def task_state(self):
+        return getattr(self.__server, 'OS-EXT-STS:task_state')
+
     def get_port(self, network):
         if network is None:
             ports = self.ports
@@ -105,21 +120,22 @@ class Instance(object):
             raise InstanceHasNoIpError(self.id)
         return ports[0]
 
-    INTERFACE_ID_RE=re.compile('<parameters interfaceid=\'([a-z0-9-]*)\'/>')
-
-    def get_port_uuid(self, network):
-        out = check_output(['virsh', 'dumpxml', self.id])
-        match = self.INTERFACE_ID_RE.search(out)
-        return match.groups()[0]
-
     def get_mac(self, network):
         return self.get_port(network).mac
 
     def get_ip(self, network):
         return self.get_port(network).ip
 
-    def get_status(self):
-        return self.__get().status
+    INTERFACE_ID_RE=re.compile('<parameters interfaceid=\'([a-z0-9-]*)\'/>')
+
+    def fetch_port_uuid(self, network):
+        out = check_output(['virsh', 'dumpxml', self.id])
+        match = self.INTERFACE_ID_RE.search(out)
+        return match.groups()[0]
+
+    def fetch_status(self):
+        self.refetch()
+        return self.status
 
     def __repr__(self):
         return 'Instance(%r, %r)' % (self.__nova, self.id)
@@ -170,7 +186,8 @@ class SharedTokenClientFactory(object):
                                         api_key=self.password,
                                         project_id=self.tenant_name,
                                         tenant_id=self.auth_ref.tenant_id,
-                                        auth_url='/v2/')
+                                        auth_url='/v2/',
+                                        extensions=self.nova_extensions)
         client.client.management_url = self.nova_api_url
         client.client.auth_token = self.auth_ref.auth_token
         return client
@@ -253,16 +270,17 @@ class Nova(object):
             self.__list_cond.notify_all()
             return self.__list
 
-    def boot(self, name, image, flavor, key_name=None):
+    def boot(self, name, image, flavor, key_name):
         instance = self.__client.servers.create(name=name,
                                                 image=image,
                                                 flavor=flavor,
                                                 key_name=key_name)
         return Instance(self, instance.id)
 
-    def live_image_start(self, name, image):
+    def live_image_start(self, name, image, key_name):
         instances = self.__client.cobalt.start_live_image(server=image,
-                                                          name=name)
+                                                          name=name,
+                                                          key_name=key_name)
         assert len(instances) == 1
         return Instance(self, instances[0].id)
 
@@ -371,7 +389,7 @@ class PhaseLog(object):
             print '       RUNNING: ',
             print 't+%.1fs' % self.timer.elapsed(), '\t',
             for phase in self.order:
-                print phase, '%-3d' % self.in_phase[phase], 
+                print phase.replace('create:', ''), '%-3d' % self.in_phase[phase], 
             print ' ',
             sys.stdout.flush()
 
@@ -456,6 +474,7 @@ class Experiment(object):
         self.phases = []
         self.instance = None
         self.console_tail = None
+        self.__instance_port = None
 
         for name in vars(self.args):
             if name.startswith('check_syslog') and getattr(self.args, name):
@@ -519,25 +538,31 @@ class Experiment(object):
                 self.syslog_tail.stop()
 
     def __boot_op(self, name):
-        return self.nova.boot(name,
-                              image=self.args.image,
-                              flavor=self.args.flavor,
-                              key_name=self.args.key_name)
+        return self.nova.boot(name, self.args.image,
+                              self.args.flavor, self.args.key_name)
 
     def __launch_op(self, name):
-        return self.nova.live_image_start(name, self.args.image)
+        return self.nova.live_image_start(name, self.args.live_image,
+                                          self.args.key_name)
 
     def __create(self):
-        self.start_phase(self.args.op + '_api')
+        self.start_phase('create:api')
         if self.args.op == 'boot':
             op_func = self.__boot_op
         else:
             op_func = self.__launch_op
-
-        self.start_phase(self.args.op)
         self.instance = op_func(self.name)
+        self.start_phase('create:none')
+        last_task_state = None
         while True:
-            status = self.instance.get_status()
+            self.instance.refetch()
+
+            task_state = self.instance.task_state
+            if task_state != last_task_state and task_state is not None:
+                self.start_phase('create:%s' % task_state)
+                last_task_state = task_state
+
+            status = self.instance.status
             assert status != 'ERROR'
             if status == 'ACTIVE':
                 break
@@ -548,7 +573,7 @@ class Experiment(object):
         self.start_phase('delete')
         while True:
             try:
-                assert self.instance.get_status() != 'ERROR'
+                assert self.instance.fetch_status() != 'ERROR'
             except InstanceDoesNotExistError:
                 break
 
@@ -610,19 +635,29 @@ class Experiment(object):
     def __check_nmap(self):
         self.start_phase('nmap')
 
+    def __get_instance_port(self):
+        if self.__instance_port is None:
+            get = lambda: self.instance.get_port(self.args.network)
+            try:
+                self.__instance_port = get()
+            except InstanceHasNoIpError:
+                self.instance.refetch()
+                self.__instance_port = get()
+        return self.__instance_port
+
     def __instance_ip(self):
-        return self.instance.get_ip(self.args.network)
+        return self.__get_instance_port().ip
 
     def __instance_mac(self):
-        return self.instance.get_mac(self.args.network)
+        return self.__get_instance_port().mac
 
     def __instance_port_uuid_prefix(self):
-        return self.instance.get_port_uuid(self.args.network).partition('-')[0]
+        uuid = self.instance.fetch_port_uuid(self.args.network)
+        return uuid.partition('-')[0]
 
     def __check_ping(self):
         self.start_phase('ping')
         while True:
-            cmd = self.netns_exec + ['ping', '-c', '1', self.__instance_ip()]
             p = Popen(self.netns_exec +
                       ['ping', '-c', '1', self.__instance_ip()],
                       stdout=DEV_NULL,
@@ -632,18 +667,24 @@ class Experiment(object):
 
     def __check_ssh(self):
         self.start_phase('ssh')
+
+        args = list(self.netns_exec)
+        args.extend([
+            'ssh',
+            '-l', self.args.check_ssh_user,
+            '-o', 'UserKnownHostsFile=/dev/null',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'PasswordAuthentication=no',
+        ])
+        if self.args.check_ssh_key is not None:
+            args.extend(['-i', self.args.check_ssh_key])
+        args.extend([
+            self.__instance_ip(),
+            self.args.check_ssh_command,
+        ])
+
         while True:
-            p = Popen(self.netns_exec +
-                      ['ssh',
-                       '-l', self.args.check_ssh_user,
-                       '-o', 'UserKnownHostsFile=/dev/null',
-                       '-o', 'StrictHostKeyChecking=no',
-                       '-o', 'PasswordAuthentication=no',
-                       self.__instance_ip(),
-                       self.args.check_ssh_command],
-                       stdout=DEV_NULL,
-                       stderr=DEV_NULL,
-                       close_fds=True)
+            p = Popen(args, stdout=DEV_NULL, stderr=DEV_NULL, close_fds=True)
             if p.wait() == 0:
                 break
             time.sleep(1)
@@ -689,8 +730,19 @@ class ParallelExperiment(object):
             progress_thread.join()
         log.report()
 
-class ArgumentLoader(object):
+class ArgumentParser(argparse.ArgumentParser):
+    def add_bool_arg(self, yes_arg, default=False, help=None):
+        assert yes_arg[:2] == '--'
+        arg_name = yes_arg[2:]
+        no_arg = '--no-%s' % arg_name
+        dest = arg_name.replace('-', '_')
+        self.add_argument(yes_arg, dest=dest, action='store_true',
+                          help=help)
+        self.add_argument(no_arg, dest=dest, action='store_false',
+                          help='Disables %s' % yes_arg)
+        self.set_defaults(**{dest: default})
 
+class ArgumentLoader(object):
     def __init__(self):
         self.__option_parser = self.__create_option_parser()
         self.__arg_parser = self.__create_arg_parser()
@@ -732,6 +784,12 @@ class ArgumentLoader(object):
                     arg_error('%s: requires --nova-instances-path' % arg)
                     sys.exit(1)
 
+        if self.__args.op == 'boot' and self.__args.image is None:
+            arg_error('boot: requires --image')
+
+        if self.__args.op == 'launch' and self.__args.live_image is None:
+            arg_error('launch: requires --live-image')
+
         return self.__args
 
     @classmethod
@@ -743,32 +801,33 @@ class ArgumentLoader(object):
 
     @classmethod
     def __create_option_parser(cls):
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--image',
-                            default='precise-server-cloudimg-amd64-disk1.img')
+        parser = ArgumentParser()
+        parser.add_argument('--image', default=None)
+        parser.add_argument('--live-image', default=None)
         parser.add_argument('--nova-instances-path', type=str, default=None)
         parser.add_argument('--flavor', default='m1.tiny')
         parser.add_argument('--key-name', default=None)
         parser.add_argument('--name-prefix', default='prof')
         parser.add_argument('--check-dhcp-hosts', type=str, default=None)
-        parser.add_argument('--check-console-dhcp', action='store_true',
+        parser.add_bool_arg('--check-console-dhcp',
                             help='note: requires --nova-instances-path')
-        parser.add_argument('--check-console-boot', action='store_true',
+        parser.add_bool_arg('--check-console-boot',
                             help='note: requires --nova-instances-path')
-        parser.add_argument('--check-syslog-ovsvsctl', action='store_true')
-        parser.add_argument('--check-syslog-dhcp', action='store_true')
-        parser.add_argument('--check-iptables', action='store_true')
-        parser.add_argument('--check-ssh', action='store_true')
+        parser.add_bool_arg('--check-syslog-ovsvsctl', default=False)
+        parser.add_bool_arg('--check-syslog-dhcp', default=False)
+        parser.add_bool_arg('--check-iptables', default=False)
+        parser.add_bool_arg('--check-ssh', default=False)
         parser.add_argument('--check-ssh-user', default='ubuntu')
         parser.add_argument('--check-ssh-command', default='true')
-        parser.add_argument('--check-ping', action='store_true')
+        parser.add_argument('--check-ssh-key', default=None)
+        parser.add_bool_arg('--check-ping', default=False)
         parser.add_argument('--check-nmap', type=int, default=None)
-        parser.add_argument('--atop', action='store_true')
+        parser.add_bool_arg('--atop', default=False)
         parser.add_argument('--atop-interval', type=int, default=2)
-        parser.add_argument('--debug', action='store_true')
-        parser.add_argument('--simple-list', action='store_true')
+        parser.add_bool_arg('--debug', default=False)
+        parser.add_argument('--simple-list', default=False)
         parser.add_argument('--client-pool-size', type=int, default=None)
-        parser.add_argument('--no-delete', dest='delete', action='store_false')
+        parser.add_bool_arg('--delete', default=True)
         parser.add_argument('--out', dest='output_path', default='.')
         parser.add_argument('--netns', default=None)
         parser.add_argument('--network', default=None)

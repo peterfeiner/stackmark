@@ -17,6 +17,7 @@ N = `echo @TITLE | sed 's/@.*//' | sed 's/.*-//'`
 DIRNAME = system("basename " . system("dirname " . TITLE))
 
 set title DIRNAME . ' N=' . N
+set title system("basename " . TITLE)
 set xlabel 'time (s)'
 set ylabel ''
 set yrange [0:1]
