@@ -11,6 +11,7 @@ import signal
 import sys
 import time
 import shlex
+import random
 
 from collections import namedtuple
 from subprocess import Popen, PIPE, check_output
@@ -231,6 +232,12 @@ class Nova(object):
                 return instance
         raise InstanceDoesNotExistError(instance_id)
 
+    def list(self):
+        if self.__simple_show:
+            return self.simple_list()
+        else:
+            return self.coalesced_list()
+
     def simple_list(self):
         return self.__client.servers.list()
 
@@ -270,17 +277,20 @@ class Nova(object):
             self.__list_cond.notify_all()
             return self.__list
 
-    def boot(self, name, image, flavor, key_name):
+    def boot(self, name, image, flavor, key_name, num_instances=1):
         instance = self.__client.servers.create(name=name,
                                                 image=image,
                                                 flavor=flavor,
-                                                key_name=key_name)
+                                                key_name=key_name,
+                                                min_count=num_instances)
         return Instance(self, instance.id)
 
-    def live_image_start(self, name, image, key_name):
-        instances = self.__client.cobalt.start_live_image(server=image,
-                                                          name=name,
-                                                          key_name=key_name)
+    def live_image_start(self, name, image, key_name, num_instances=1):
+        instances =\
+            self.__client.cobalt.start_live_image(server=image,
+                                                  name=name,
+                                                  key_name=key_name,
+                                                  num_instances=num_instances)
         assert len(instances) == 1
         return Instance(self, instances[0].id)
 
@@ -463,13 +473,96 @@ class Tail(object):
         self.__p.stdout.close()
         self.__p = None
 
+class InstanceCreator(object):
+    def __init__(self, nova, nova_op, total, name_prefix,
+                 image, key_name, flavor):
+        self.nova = nova
+        self.total = total
+        self.name_prefix = name_prefix
+        self.nova_op = nova_op
+        self.image = image
+        self.key_name = key_name
+        self.flavor = flavor
+        self.__created = 0
+        self._cond = Condition()
+
+    @staticmethod
+    def create(nova, args):
+        if args.multi:
+            cls = MultiInstanceCreator
+        else:
+            cls = SingleInstanceCreator
+
+        if args.op == 'boot':
+            func = nova.boot
+            image = args.image
+        elif args.op == 'launch':
+            func = nova.live_image_start
+            image = args.live_image
+        else:
+            raise ValueError(args.op)
+
+        return cls(nova, func, args.n, '%s-%s' % (args.name_prefix, args.op),
+                   image, args.key_name, args.flavor)
+
+    def _do_nova_op(self, name, num_instances):
+        return self.nova_op(name, self.image, self.flavor, self.key_name,
+                            num_instances)
+
+    def next_instance(self):
+        with self._cond:
+            self.__created += 1
+            id = self.__created
+        assert id <= self.total
+        return self._next_instance(id)
+
+class SingleInstanceCreator(InstanceCreator):
+    def _next_instance(self, id):
+        name = '%s-%d-of-%d' % (self.name_prefix, id, self.total)
+        return self._do_nova_op(name, num_instances=1)
+
+class MultiInstanceCreator(InstanceCreator):
+    __state = 'init'
+
+    def _next_instance(self, id):
+        with self._cond:
+            if self.__state == 'init':
+                try:
+                    self.__state = 'waiting'
+                    self.__seen = set()
+                    self.__available = set()
+                    self.__multi_prefix = 'multi-%d' % random.randint(0, 10000)
+                    i = self._do_nova_op(self.__multi_prefix, num_instances=self.total)
+                    self.__seen = set([i.id])
+                    self.__available = set([i.id])
+                    self.__state = 'done'
+                except:
+                    self.__state = 'error'
+                    raise
+                finally:
+                    self._cond.notify_all()
+
+            while self.__state is 'waiting':
+                self._cond.wait()
+
+            if self.__state is 'error':
+                raise Exception()
+
+            while not self.__available:
+                for instance in self.nova.list():
+                    if instance.id not in self.__seen:
+                        self.__seen.add(instance.id)
+                        self.__available.add(instance.id)
+
+            return Instance(self.nova, self.__available.pop())
+
 class Experiment(object):
-    def __init__(self, name, args, nova):
+    def __init__(self, args, nova, creator):
         self.args = args
+        self.creator = creator
         self.timer = Timer('total')
         self.phase = 'setup'
         self.listeners = []
-        self.name = name
         self.nova = nova
         self.phases = []
         self.instance = None
@@ -537,21 +630,17 @@ class Experiment(object):
             if self.syslog_tail != None:
                 self.syslog_tail.stop()
 
-    def __boot_op(self, name):
+    def boot_op(self, name):
         return self.nova.boot(name, self.args.image,
                               self.args.flavor, self.args.key_name)
 
-    def __launch_op(self, name):
+    def launch_op(self, name):
         return self.nova.live_image_start(name, self.args.live_image,
                                           self.args.key_name)
 
     def __create(self):
         self.start_phase('create:api')
-        if self.args.op == 'boot':
-            op_func = self.__boot_op
-        else:
-            op_func = self.__launch_op
-        self.instance = op_func(self.name)
+        self.instance = self.creator.next_instance()
         self.start_phase('create:none')
         last_task_state = None
         while True:
@@ -659,7 +748,7 @@ class Experiment(object):
         self.start_phase('ping')
         while True:
             p = Popen(self.netns_exec +
-                      ['ping', '-c', '1', self.__instance_ip()],
+                      ['ping', '-c', '1', '-w', '1', self.__instance_ip()],
                       stdout=DEV_NULL,
                       close_fds=True)
             if p.wait() == 0:
@@ -690,7 +779,8 @@ class Experiment(object):
             time.sleep(1)
 
 class ParallelExperiment(object):
-    def __init__(self, args, atop, nova, title, output_path):
+    def __init__(self, args, atop, nova, title, creator, output_path):
+        self.creator = creator
         self.args = args
         self.atop = atop
         self.nova = nova
@@ -707,9 +797,7 @@ class ParallelExperiment(object):
             log.print_progress()
             progress_thread.start()
             for i in range(self.args.n):
-                experiment = Experiment('%s-%s-of-%s' % (self.args.name_prefix,
-                                                         i + 1, self.args.n),
-                                        self.args, self.nova)
+                experiment = Experiment(self.args, self.nova, self.creator)
                 experiment.add_listener(log.event)
                 thread = Thread(target=experiment.run,
                                 name='experiment %d' % (i + 1))
@@ -779,8 +867,8 @@ class ArgumentLoader(object):
 
         if not self.__args.nova_instances_path:
             for var in ['check_console_dhcp', 'check_console_boot']:
-                if not self.__args.getattr(var):
-                    arg = '--%s' % arg.replace('_', '-')
+                if getattr(self.__args, var):
+                    arg = '--%s' % var.replace('_', '-')
                     arg_error('%s: requires --nova-instances-path' % arg)
                     sys.exit(1)
 
@@ -831,6 +919,7 @@ class ArgumentLoader(object):
         parser.add_argument('--out', dest='output_path', default='.')
         parser.add_argument('--netns', default=None)
         parser.add_argument('--network', default=None)
+        parser.add_argument('--multi', action='store_true')
         return parser
 
 def load_args():
@@ -883,8 +972,9 @@ def main():
     nova = Nova(client_factory,
                 simple_list=args.simple_list,
                 instances_path=args.nova_instances_path)
+    creator = InstanceCreator.create(nova, args)
     experiment = ParallelExperiment(args, atop=atop, nova=nova, title=title,
-                                    output_path=args.output_path)
+                                    creator=creator, output_path=args.output_path)
     experiment.run()
 
 if __name__ == '__main__':
