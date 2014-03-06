@@ -340,12 +340,14 @@ class NullAtop(object):
         pass
 
 class PhaseLog(object):
-    def __init__(self, timer, title, output_path):
+    def __init__(self, timer, title, output_path, order=None):
+        if order is None:
+            order = []
+        self.order = order
+        self.in_phase = dict([(phase, 0) for phase in self.order])
         self.last_phase = {}
-        self.in_phase = {}
         self.timer = timer
         self.lock = Lock()
-        self.order = []
         self.last_in_phase = {}
         self.data = open('%s/%s.phases' % (output_path, title), 'w')
 
@@ -581,6 +583,33 @@ class Experiment(object):
         else:
             self.netns_exec = []
 
+    @classmethod
+    def phase_order(self, args):
+        arg2phases = [
+            (True, ['create:api',
+                    'create:none',
+                    'create:scheduling',
+                    'create:networking',
+                    'create:block_device_mapping',
+                    'create:spawning']),
+            (args.check_dhcp_hosts, ['dhcp_hosts']),
+            (args.check_syslog_ovsvsctl, ['syslog_ovsvsctl']),
+            (args.check_console_boot, ['console_boot']),
+            (args.check_iptables, ['iptables']),
+            (args.check_syslog_dhcp, ['syslog_dhcp']),
+            (args.check_console_dhcp, ['console_dhcp']),
+            (args.check_ping, ['ping']),
+            (args.check_nmap, ['nmap']),
+            (args.check_ssh, ['ssh']),
+            (args.delete, ['delete_api', 'delete']),
+            (True, ['fin']),
+        ]
+        r = []
+        for arg, phases in arg2phases:
+            if arg:
+                r.extend(phases)
+        return r
+
     def add_listener(self, listener):
         self.listeners.append(listener)
 
@@ -791,14 +820,14 @@ class ParallelExperiment(object):
         self.output_path = output_path
 
     def run(self):
+        status_line('       RUNNING: ...')
         threads = []
         timer = Timer('total')
-        log = PhaseLog(timer, self.title, self.output_path)
+        log = PhaseLog(timer, self.title, self.output_path,
+                       Experiment.phase_order(self.args))
         progress_thread = PeriodicCaller(1, log.print_progress)
         timer.start()
         with self.atop, log:
-            log.print_progress()
-            progress_thread.start()
             for i in range(self.args.n):
                 experiment = Experiment(self.args, self.nova, self.creator)
                 experiment.add_listener(log.event)
@@ -807,6 +836,8 @@ class ParallelExperiment(object):
                 thread.daemon = True
                 thread.start()
                 threads.append(thread)
+            log.print_progress()
+            progress_thread.start()
 
             # Join all of the threads. Wakeup every 1s so we can check for
             # keyboard interrupts.
