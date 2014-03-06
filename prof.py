@@ -749,7 +749,9 @@ class Experiment(object):
         while True:
             p = Popen(self.netns_exec +
                       ['ping', '-c', '1', '-w', '1', self.__instance_ip()],
+                      stderr=DEV_NULL,
                       stdout=DEV_NULL,
+                      stdin=DEV_NULL,
                       close_fds=True)
             if p.wait() == 0:
                 break
@@ -773,7 +775,8 @@ class Experiment(object):
         ])
 
         while True:
-            p = Popen(args, stdout=DEV_NULL, stderr=DEV_NULL, close_fds=True)
+            p = Popen(args, stdout=DEV_NULL, stderr=DEV_NULL, stdin=DEV_NULL,
+                      close_fds=True)
             if p.wait() == 0:
                 break
             time.sleep(1)
