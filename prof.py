@@ -23,14 +23,15 @@ import novaclient.shell
 
 DEV_NULL = open('/dev/null', 'w+')
 
-PRINT_LOCK = Lock()
+print_lock = Lock()
 
-def status_line(msg=None):
-    print '\r', ' ' * 80, '\r',
-    if msg is not None:
-        print msg,
-        print ' ',
-    sys.stdout.flush()
+last_status_len = 0
+def status_line(msg):
+    global last_status_len
+    with print_lock:
+        print '\r', msg, ' ' * (last_status_len - len(msg)), '\r',
+        sys.stdout.flush()
+        last_status_len = len(msg)
 
 def timestamp():
     return str(datetime.datetime.now())
@@ -261,7 +262,7 @@ class Nova(object):
                 new_list = self.__client.servers.list()
                 break
             except Exception, e:
-                with PRINT_LOCK:
+                with print_lock:
                     print 'error retrieving list (%s), retrying in 0.5s' % e
                 time.sleep(0.5)
                 continue
@@ -396,19 +397,18 @@ class PhaseLog(object):
         #self.print_progress()
 
     def print_progress(self):
-        with self.lock, PRINT_LOCK:
-            status_line()
-            print '       RUNNING: ',
-            print 't+%.1fs' % self.timer.elapsed(), '\t',
+        with self.lock:
+            parts = ['       RUNNING: ',
+                     't+%.1fs' % self.timer.elapsed(),
+                     '\t']
             for phase in self.order:
-                print phase.replace('create:', ''), '%-3d' % self.in_phase[phase], 
-            print ' ',
-            sys.stdout.flush()
-
+                parts.extend([phase.replace('create:', ''),
+                              ' %-3d' % self.in_phase[phase]])
+            status_line(''.join(parts))
 
     def report(self):
         self.print_progress()
-        with PRINT_LOCK:
+        with print_lock:
             # One newline to clear the status line .
             print 
             return
@@ -825,7 +825,7 @@ class ParallelExperiment(object):
         timer = Timer('total')
         log = PhaseLog(timer, self.title, self.output_path,
                        Experiment.phase_order(self.args))
-        progress_thread = PeriodicCaller(1, log.print_progress)
+        progress_thread = PeriodicCaller(0.1, log.print_progress)
         timer.start()
         with self.atop, log:
             for i in range(self.args.n):
