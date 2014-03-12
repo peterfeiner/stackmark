@@ -2,8 +2,17 @@
 
 set -e
 
-for x in $(find . -name '*.atop'); do
-    ./plot.py $(dirname $x)/$(basename $x .atop) &
+for x in $(find . -name '*.phases'); do
+    base="$(dirname $x)/$(basename $x .phases)"
+    (
+        ./plot.py $base > $base.log 2>&1
+        if [[ "$?" != 0 ]]; then
+            echo $base error
+            cat $base.log
+        else
+            echo $base ok
+        fi
+    ) &
 done
 
 wait
