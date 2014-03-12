@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 
 import argparse
 import datetime
@@ -12,6 +12,9 @@ import sys
 import time
 import shlex
 import random
+import math
+import traceback
+import resource
 
 from collections import namedtuple
 from subprocess import Popen, PIPE, check_output
@@ -21,9 +24,88 @@ import keystoneclient.v2_0.client
 import novaclient
 import novaclient.shell
 
+class Stats(object):
+    max = 0
+    total = 0
+    n = 0
+    max_where = ''
+
+    def update(self, start):
+        current = time.time() - start
+        assert current >= 0
+        if current > self.max:
+            self.max = current
+            self.max_where = traceback.format_stack()
+        self.n += 1
+        self.total += current
+
+class ProfiledLock(object):
+
+    all_locks = []
+
+    def __init__(self, name, lock_cls=None):
+        if lock_cls is None:
+            lock_cls = Lock
+        self._lock = lock_cls()
+        self.__stats = {}
+        self.name = name
+        self.all_locks.append(self)
+
+    def _update_stat(self, name, start):
+        try:
+            stat = self.__stats[name]
+        except KeyError:
+            stat = Stats()
+            self.__stats[name] = stat
+        stat.update(start)
+
+    def report(self, out):
+        out.write('         max      total    avg      n')
+        for name, stats in self.__stats.items():
+            out.write('\n%-9s%-9.1e%-9.1e%-9.1e%d' %
+                      (name, stats.max, stats.total,
+                       stats.total / stats.n, stats.n))
+
+    @classmethod
+    def report_all(cls, out):
+        for lock in cls.all_locks:
+            out.write('\x1b[1m%s:\x1b[0m\n' % lock.name)
+            lock.report(out)
+            out.write('\n')
+
+    def __enter__(self):
+        start = time.time()
+        self._lock.acquire()
+        self._update_stat('acquire', start)
+        self._hold_start = time.time()
+
+    def __exit__(self, type, value, traceback):
+        self._update_stat('held', self._hold_start)
+        self._lock.release()
+
+class ProfiledCondition(ProfiledLock):
+
+    def __init__(self, name, lock_cls=None):
+        if lock_cls is None:
+            lock_cls = Condition
+        ProfiledLock.__init__(self, name, lock_cls)
+
+    def notify(self):
+        self._lock.notify()
+
+    def notify_all(self):
+        self._lock.notify_all()
+
+    def wait(self, timeout=None):
+        start = time.time()
+        self._update_stat('held', self._hold_start)
+        self._lock.wait(timeout)
+        self._hold_start = time.time()
+        self._update_stat('wait', start)
+
 DEV_NULL = open('/dev/null', 'w+')
 
-print_lock = Lock()
+print_lock = ProfiledLock('print')
 
 last_status_len = 0
 def status_line(msg):
@@ -143,7 +225,6 @@ class Instance(object):
         return 'Instance(%r, %r)' % (self.__nova, self.id)
 
 class SharedTokenClientFactory(object):
-
     def __init__(self, username, password, tenant_name, tenant_id, auth_url):
         self.username = username
         self.password = password
@@ -151,44 +232,23 @@ class SharedTokenClientFactory(object):
         self.tenant_id = tenant_id
         self.auth_url = auth_url
 
-        self._auth_ref = None
-        self._nova_extensions = None
+        self.auth_ref = self.create_keystone().auth_ref
+        self.nova_api_url = self.auth_ref.\
+                                 service_catalog.\
+                                 url_for(attr='region',
+                                         service_type='compute',
+                                         endpoint_type='publicURL')
+        self.nova_extensions = novaclient.shell.\
+                                          OpenStackComputeShell().\
+                                          _discover_extensions('1.1')
 
-    @property
-    def auth_ref(self):
-        if self._auth_ref is None:
-            self.refresh_auth_ref()
-        return self._auth_ref
-
-    @property
-    def service_catalog(self):
-        return self.auth_ref.service_catalog
-
-    @property
-    def nova_api_url(self):
-        return self.service_catalog.url_for(attr='region',
-                                            service_type='compute',
-                                            endpoint_type='publicURL')
-
-    @property
-    def nova_extensions(self):
-        if self._nova_extensions is None:
-            self.refresh_nova_extensions()
-        return self._nova_extensions
-
-    def refresh_auth_ref(self):
-        self._auth_ref = self.create_keystone().auth_ref
-
-    def refresh_nova_extensions(self):
-        shell = novaclient.shell.OpenStackComputeShell()
-        self._nova_extensions = shell._discover_extensions('1.1')
 
     def create_nova(self):
         client = novaclient.v1_1.Client(username=self.username,
                                         api_key=self.password,
                                         project_id=self.tenant_name,
                                         tenant_id=self.auth_ref.tenant_id,
-                                        auth_url='/v2/',
+                                        auth_url='shared-token-did-not-work!',
                                         extensions=self.nova_extensions)
         client.client.management_url = self.nova_api_url
         client.client.auth_token = self.auth_ref.auth_token
@@ -201,14 +261,85 @@ class SharedTokenClientFactory(object):
                                                  tenant_id=self.tenant_id,
                                                  auth_url=self.auth_url)
 
-    def prepare(self):
-        self.auth_ref
-        self.nova_extensions
+
+class MockClientFactory(object):
+
+    class Server(object):
+        def __init__(self, name, id):
+            self.name = name
+            self.id = id
+            self.__timer = Timer('server')
+            self.__states = [(random.random() * 2.0, 'BUILD', None),
+                             (random.random() * 2.0, 'BUILD', 'scheduling'),
+                             (random.random() * 2.0, 'BUILD', 'block_device_mapping'),
+                             (random.random() * 2.0, 'BUILD', 'networking'),
+                             (random.random() * 2.0, 'BUILD', 'spawning'),
+                             (random.random() * 2.0, 'ACTIVE', None)]
+            setattr(self, 'OS-EXT-STS:task_state', None)
+
+        def __getattribute__(self, name):
+            if name == 'OS-EXT-STS:task_state':
+                return getattr(self, 'task_state')
+            return object.__getattribute__(self, name)
+
+        def __getattr__(self, name):
+            elapsed = self.__timer.elapsed()
+            cumulative = 0
+            for timeout, status, task_state in self.__states:
+                if timeout + cumulative > elapsed:
+                    break
+                cumulative += timeout
+            with print_lock:
+                print '\n', timeout, cumulative, elapsed
+            if name == 'task_state':
+                return task_state
+            if name == 'status':
+                return status
+            return object.__getattr__(self, name)
+
+    class Namespace(object):
+        pass
+
+    def __init__(self):
+        self.__servers = {}
+        self.__lock = ProfiledLock('mock client factory')
+        self.__id = 0
+        self.servers = self.Namespace()
+        self.cobalt = self.Namespace()
+        setattr(self.servers, 'create', self.__servers_create)
+        setattr(self.servers, 'delete', self.__servers_delete)
+        setattr(self.servers, 'list', self.__servers_list)
+        setattr(self.cobalt, 'start_live_image', self.__cobalt_start_live_image)
+
+    def create_nova(self):
+        return self
+
+    def __create_next(self, name):
+        with self.__lock:
+            server = self.Server(name, str(self.__id))
+            self.__servers[server.id] = server
+            self.__id += 1
+        return server
+
+    def __servers_create(self, name, image, flavor, key_name, min_count):
+        return self.__create_next(name)
+
+    def __servers_delete(self, id):
+        with self.__lock:
+            del self.__servers[id]
+
+    def __servers_list(self):
+        time.sleep(random.random() * 4)
+        with self.__lock:
+            return self.__servers.values()
+
+    def __cobalt_start_live_image(self, server, name, key_name, num_instances):
+        return self.__create_next(name)
 
 class Nova(object):
     def __init__(self, client_factory, simple_list, instances_path):
-        self.__list = []
-        self.__list_cond = Condition()
+        self.__list = {}
+        self.__list_cond = ProfiledCondition('nova list')
         self.__list_status = 'IDLE'
         self.__tls = local()
         self.__client_factory = client_factory
@@ -225,19 +356,23 @@ class Nova(object):
 
     def show(self, instance_id):
         if not self.__simple_show:
-            for instance in self.coalesced_list():
+            for i in range(2):
+                instances = self.coalesced_list()
+                try:
+                    return instances[instance_id]
+                except KeyError:
+                    pass
+        else:
+            for instance in self.simple_list():
                 if instance.id == instance_id:
                     return instance
-        for instance in self.simple_list():
-            if instance.id == instance_id:
-                return instance
         raise InstanceDoesNotExistError(instance_id)
 
     def list(self):
         if self.__simple_show:
             return self.simple_list()
         else:
-            return self.coalesced_list()
+            return self.coalesced_list().values()
 
     def simple_list(self):
         return self.__client.servers.list()
@@ -250,8 +385,7 @@ class Nova(object):
                 while True:
                     self.__list_cond.wait()
                     if self.__list_status == 'ERROR':
-                        self.__list_status = 'ACTIVE'
-                        break
+                        raise Exception('Error in list, aborting.')
                     elif self.__list_status == 'IDLE':
                         return self.__list
                     else:
@@ -263,9 +397,8 @@ class Nova(object):
                 break
             except Exception, e:
                 with print_lock:
-                    print 'error retrieving list (%s), retrying in 0.5s' % e
-                time.sleep(0.5)
-                continue
+                    print 'error retrieving list (%s), retrying in 1s' % e
+                time.sleep(1)
             except:
                 with self.__list_cond:
                     self.__list_status = 'ERROR'
@@ -273,7 +406,10 @@ class Nova(object):
                 raise
 
         with self.__list_cond:
-            self.__list = new_list
+            self.__list = {}
+            for server in new_list:
+                assert server.id not in self.__list
+                self.__list[server.id] = server
             self.__list_status = 'IDLE'
             self.__list_cond.notify_all()
             return self.__list
@@ -286,7 +422,7 @@ class Nova(object):
                                                 min_count=num_instances)
         return Instance(self, instance.id)
 
-    def live_image_start(self, name, image, key_name, num_instances=1):
+    def live_image_start(self, name, image, flavor, key_name, num_instances=1):
         instances =\
             self.__client.cobalt.start_live_image(server=image,
                                                   name=name,
@@ -341,16 +477,17 @@ class NullAtop(object):
         pass
 
 class PhaseLog(object):
-    def __init__(self, timer, title, output_path, order=None):
+    def __init__(self, timer, title, output_path, order, total):
         if order is None:
             order = []
         self.order = order
         self.in_phase = dict([(phase, 0) for phase in self.order])
         self.last_phase = {}
         self.timer = timer
-        self.lock = Lock()
+        self.lock = ProfiledCondition('phase')
         self.last_in_phase = {}
         self.data = open('%s/%s.phases' % (output_path, title), 'w')
+        self.total = total
 
     def __enter__(self):
         self.start()
@@ -368,6 +505,7 @@ class PhaseLog(object):
     def event(self, experiment, *args):
         t = self.timer.elapsed()
         with self.lock:
+
             phase = experiment.phase
             if phase not in self.in_phase:
                 self.order.append(phase)
@@ -376,7 +514,6 @@ class PhaseLog(object):
                 last_phase = self.last_phase[experiment]
             except KeyError:
                 last_phase = None
-                pass
             else:
                 # No change.
                 if last_phase == phase:
@@ -397,20 +534,21 @@ class PhaseLog(object):
         #self.print_progress()
 
     def print_progress(self):
+        width = int(math.ceil(math.log(max(1, self.total), 10))) + 1
+        fmt = ' %%-%dd ' % width
         with self.lock:
-            parts = ['       RUNNING: ',
-                     't+%.1fs' % self.timer.elapsed(),
-                     '\t']
+            parts = ['       RUNNING: %-9s '
+                     % ('t+%.1fs' % self.timer.elapsed())]
             for phase in self.order:
                 parts.extend([phase.replace('create:', ''),
-                              ' %-3d' % self.in_phase[phase]])
+                              fmt % self.in_phase[phase]])
             status_line(''.join(parts))
 
     def report(self):
         self.print_progress()
         with print_lock:
             # One newline to clear the status line .
-            print 
+            print
             return
             fmtstr = '%%-%ds %%-10s' % (max([len('PHASE')] + map(len, self.order)))
             print fmtstr % ('PHASE', 'LAST')
@@ -432,7 +570,7 @@ class PeriodicCaller(Thread):
         self.__period = period
         self.__callee = lambda: func(*args, **kwargs)
         self.__stopped = False
-        self.__cond = Condition()
+        self.__cond = ProfiledCondition('periodic')
 
     def run(self):
         with self.__cond:
@@ -486,7 +624,7 @@ class InstanceCreator(object):
         self.key_name = key_name
         self.flavor = flavor
         self.__created = 0
-        self._cond = Condition()
+        self._cond = ProfiledCondition('creator')
 
     @staticmethod
     def create(nova, args):
@@ -626,7 +764,7 @@ class Experiment(object):
         self.event()
 
     def phase_error(self, msg):
-        raise PhaseError('Error during phase %s for instance %s: %s' % 
+        raise PhaseError('Error during phase %s for instance %s: %s' %
                          (self.phase, self.instance.id, msg))
 
     def run(self):
@@ -824,8 +962,8 @@ class ParallelExperiment(object):
         threads = []
         timer = Timer('total')
         log = PhaseLog(timer, self.title, self.output_path,
-                       Experiment.phase_order(self.args))
-        progress_thread = PeriodicCaller(0.1, log.print_progress)
+                       Experiment.phase_order(self.args), self.args.n)
+        progress_thread = PeriodicCaller(1, log.print_progress)
         timer.start()
         with self.atop, log:
             for i in range(self.args.n):
@@ -954,6 +1092,7 @@ class ArgumentLoader(object):
         parser.add_argument('--netns', default=None)
         parser.add_argument('--network', default=None)
         parser.add_argument('--multi', action='store_true')
+        parser.add_argument('--mock', action='store_true')
         return parser
 
 def load_args():
@@ -974,10 +1113,38 @@ def setup_faulthandler(args):
         faulthandler.enable()
         faulthandler.register(signal.SIGINT)
 
+def dump_lock_stats():
+    with print_lock:
+        sys.stdout.write('\n')
+        ProfiledLock.report_all(sys.stdout)
+        sys.stdout.flush()
+
+def handle_sigint(sig, frame):
+    dump_lock_stats()
+
+def maximize_open_files_limit():
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    return hard
+
 def main():
     args = load_args()
 
-    setup_faulthandler(args)
+    max_open_files = maximize_open_files_limit()
+
+    # Limit comes from one Popen with stdout redirected to a pipe() per thread
+    # plus some extra descriptors for our use.
+    if args.n * 2 + 20 > max_open_files:
+        sys.stderr.write('The maximum number of open file descriptors for '
+                         'this process is limited to %d. You need at least '
+                         '2 * N + 20 = %d to not run out when profiling N = %d '
+                         'instances. Use your shell\'s ulimit command to '
+                         'increase this limit. \n' %
+                         (max_open_files, args.n * 2 + 20, args.n))
+        return 1
+
+    #setup_faulthandler(args)
+    signal.signal(signal.SIGINT, handle_sigint)
 
     if args.client_pool_size == None:
         args.client_pool_size = args.n
@@ -993,15 +1160,17 @@ def main():
     else:
         atop = NullAtop()
 
-    client_factory =\
-        SharedTokenClientFactory(username=os.environ['OS_USERNAME'],
-                                 password=os.environ['OS_PASSWORD'],
-                                 tenant_name=os.environ.get('OS_TENANT_NAME'),
-                                 tenant_id=os.environ.get('OS_TENANT_ID'),
-                                 auth_url=os.environ['OS_AUTH_URL'])
+    if args.mock:
+        client_factory = MockClientFactory()
+    else:
+        client_factory =\
+            SharedTokenClientFactory(username=os.environ['OS_USERNAME'],
+                                     password=os.environ['OS_PASSWORD'],
+                                     tenant_name=os.environ.get('OS_TENANT_NAME'),
+                                     tenant_id=os.environ.get('OS_TENANT_ID'),
+                                     auth_url=os.environ['OS_AUTH_URL'])
     status_line('AUTHENTICATING: ...')
     sys.stdout.flush()
-    client_factory.prepare()
 
     nova = Nova(client_factory,
                 simple_list=args.simple_list,
